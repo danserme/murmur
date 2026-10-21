@@ -118,3 +118,24 @@ struct AppearanceToggle: View {
         .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
 }
+
+/// Round, icon-only control for secondary actions. Keep a text `Label` so VoiceOver still reads its name.
+struct LTIconButtonStyle: ButtonStyle {
+    var size: CGFloat = LTTheme.controlHeight
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .labelStyle(.iconOnly)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(isEnabled ? LTTheme.ink.opacity(0.78) : LTTheme.muted.opacity(0.5))
+            .frame(width: size, height: size)
+            .background(isEnabled ? LTTheme.wash : LTTheme.wash.opacity(0.5))
+            .overlay(Circle().strokeBorder(LTTheme.hairline, lineWidth: 0.5))
+            .clipShape(Circle())
+            .contentShape(Circle())
+            .scaleEffect(configuration.isPressed ? 0.94 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+            .pointerStyle(isEnabled ? .link : .default)
+    }
+}

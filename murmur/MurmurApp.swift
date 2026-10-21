@@ -38,7 +38,7 @@ struct MurmurApp: App {
                     Text("murmur is in Applications. Move the disk image to the Trash so it doesn’t stay in Downloads.")
                 }
         }
-        .defaultSize(width: 1100, height: 740)
+        .defaultSize(width: 1320, height: 860)
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentMinSize)
         .commands {
@@ -68,6 +68,12 @@ struct MurmurApp: App {
                 }
                 .keyboardShortcut("s", modifiers: [.command, .shift])
                 .disabled(!workspace.canSummarize)
+
+                Button("Translate to English") {
+                    workspace.requestTranslation()
+                }
+                .keyboardShortcut("t", modifiers: [.command, .shift])
+                .disabled(!workspace.canTranslate)
 
                 Button("Stop") {
                     workspace.stop()

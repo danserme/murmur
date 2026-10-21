@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Translation
 
 struct ContentView: View {
     @Environment(Workspace.self) private var workspace
@@ -15,23 +16,7 @@ struct ContentView: View {
                 .padding(.bottom, LTTheme.spaceMD)
 
             HStack(alignment: .top, spacing: 0) {
-                PreviewPane(
-                    title: "Transcript",
-                    text: transcriptBinding,
-                    placeholder: transcriptPlaceholder,
-                    isBusy: workspace.phase == .transcribing || workspace.phase == .preparing,
-                    progress: workspace.phase == .transcribing || workspace.phase == .preparing
-                        ? workspace.jobProgress
-                        : nil,
-                    isEditable: workspace.phase != .transcribing && workspace.phase != .preparing,
-                    primaryTitle: "Transcribe",
-                    primaryEnabled: workspace.canTranscribe,
-                    primaryAction: workspace.transcribeCurrentFile,
-                    showsStop: workspace.phase == .transcribing || workspace.phase == .preparing,
-                    copyAction: workspace.copyTranscript,
-                    sourceHighlight: workspace.sourceHighlight,
-                    sourceHighlightTick: workspace.sourceHighlightTick
-                )
+                transcriptSide
                 Rectangle()
                     .fill(LTTheme.hairline)
                     .frame(width: 1)
@@ -43,9 +28,14 @@ struct ContentView: View {
                     isBusy: workspace.phase == .summarizing,
                     progress: nil,
                     isEditable: workspace.phase != .summarizing,
-                    primaryTitle: "Summarize",
-                    primaryEnabled: workspace.canSummarize,
-                    primaryAction: workspace.summarizeTranscript,
+                    primary: PaneAction(
+                        title: "Summarize",
+                        systemImage: "text.alignleft",
+                        help: "Write a summary of the transcript",
+                        isEnabled: workspace.canSummarize,
+                        shortcut: KeyboardShortcut("s", modifiers: [.command, .shift]),
+                        perform: workspace.summarizeTranscript
+                    ),
                     showsStop: workspace.phase == .summarizing,
                     copyAction: workspace.copySummary,
                     locatesSource: true
@@ -55,7 +45,13 @@ struct ContentView: View {
         }
         .background(LTTheme.canvas)
         .tint(LTTheme.accent)
-        .frame(minWidth: 920, minHeight: 640)
+        .frame(minWidth: 1040, minHeight: 640)
+        .translationTask(workspace.translationConfiguration) { session in
+            await workspace.translate(using: session)
+        }
+        .task {
+            await workspace.loadLanguages()
+        }
         .fileImporter(
             isPresented: $workspace.isFileImporterPresented,
             allowedContentTypes: workspace.allowedContentTypes,
@@ -88,6 +84,77 @@ struct ContentView: View {
         }
     }
 
+    private var isTranscribing: Bool {
+        workspace.phase == .transcribing || workspace.phase == .preparing
+    }
+
+    private var transcriptTabs: Binding<Workspace.TranscriptTab>? {
+        guard workspace.showsTranslationTab else { return nil }
+        return Binding(
+            get: { workspace.transcriptTab },
+            set: { workspace.transcriptTab = $0 }
+        )
+    }
+
+    private var translateAction: PaneAction {
+        PaneAction(
+            title: "Translate",
+            systemImage: "translate",
+            help: "Translate the transcript to English on this Mac",
+            isEnabled: workspace.canTranslate,
+            shortcut: KeyboardShortcut("t", modifiers: [.command, .shift]),
+            perform: workspace.requestTranslation
+        )
+    }
+
+    @ViewBuilder
+    private var transcriptSide: some View {
+        if workspace.showsTranslationTab && workspace.transcriptTab == .translation {
+            PreviewPane(
+                title: "Translation",
+                tabs: transcriptTabs,
+                text: translationBinding,
+                placeholder: "Press Translate to get an English version of the transcript.",
+                isBusy: workspace.isTranslating,
+                progress: workspace.translationProgress,
+                isEditable: !workspace.isTranslating,
+                primary: translateAction,
+                showsStop: workspace.isTranslating,
+                copyAction: workspace.copyTranslation
+            )
+        } else {
+            PreviewPane(
+                title: "Transcript",
+                tabs: transcriptTabs,
+                text: transcriptBinding,
+                placeholder: transcriptPlaceholder,
+                isBusy: isTranscribing,
+                progress: isTranscribing ? workspace.jobProgress : nil,
+                isEditable: !isTranscribing,
+                primary: PaneAction(
+                    title: "Transcribe",
+                    systemImage: "waveform",
+                    help: "Turn this recording into text",
+                    isEnabled: workspace.canTranscribe,
+                    shortcut: KeyboardShortcut("t", modifiers: .command),
+                    perform: workspace.transcribeCurrentFile
+                ),
+                secondary: workspace.needsTranslation ? translateAction : nil,
+                showsStop: isTranscribing,
+                copyAction: workspace.copyTranscript,
+                sourceHighlight: workspace.sourceHighlight,
+                sourceHighlightTick: workspace.sourceHighlightTick
+            )
+        }
+    }
+
+    private var translationBinding: Binding<String> {
+        Binding(
+            get: { workspace.translation },
+            set: { workspace.replaceTranslation($0) }
+        )
+    }
+
     private var transcriptBinding: Binding<String> {
         Binding(
             get: { workspace.displayedTranscript },
@@ -104,7 +171,7 @@ struct ContentView: View {
 
     private var transcriptPlaceholder: String {
         if workspace.recording == nil && !workspace.capture.isRecording {
-            return "Record or open a file, then transcribe it here."
+            return "Record or open a file to transcribe it here, or type or paste text."
         }
         return "The transcript will appear as speech is recognized on this Mac."
     }
@@ -172,13 +239,23 @@ private struct CaptureBar: View {
                     .font(LTTheme.statusFont)
                     .foregroundStyle(LTTheme.muted)
                     .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help(workspace.statusMessage)
             }
+            .frame(minWidth: 120, alignment: .leading)
+            .layoutPriority(1)
 
             Spacer(minLength: 8)
 
             if !isRecording, let recording = workspace.recording {
                 AudioPreview(url: recording.fileURL)
+                Rectangle()
+                    .fill(LTTheme.hairline)
+                    .frame(width: 1, height: 22)
             }
+
+            LanguagePicker()
+                .layoutPriority(2)
 
             if !isRecording {
                 Button {
@@ -187,6 +264,8 @@ private struct CaptureBar: View {
                     Label("Open file", systemImage: "folder")
                 }
                 .buttonStyle(LTActionButtonStyle())
+                .fixedSize()
+                .layoutPriority(2)
                 .disabled(workspace.phase.isBusy)
                 .help("Choose an audio or video file to transcribe")
             }
@@ -265,18 +344,65 @@ private struct RecordButton: View {
     }
 }
 
+private struct LanguagePicker: View {
+    @Environment(Workspace.self) private var workspace
+
+    var body: some View {
+        Menu {
+            Picker("Spoken language", selection: selection) {
+                ForEach(workspace.availableLanguages, id: \.identifier) { locale in
+                    Text(TranscriptionLanguage.title(for: locale)).tag(locale.identifier)
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Label(workspace.languageTitle, systemImage: "globe")
+        }
+        .menuStyle(.button)
+        .menuIndicator(.hidden)
+        .buttonStyle(LTActionButtonStyle())
+        .fixedSize()
+        .disabled(!workspace.canChangeLanguage || workspace.availableLanguages.isEmpty)
+        .help("Language spoken in the recording")
+    }
+
+    private var selection: Binding<String> {
+        Binding(
+            get: {
+                workspace.availableLanguages
+                    .first { TranscriptionLanguage.matches($0, workspace.transcriptionLocale) }?
+                    .identifier ?? workspace.transcriptionLocale.identifier
+            },
+            set: { identifier in
+                if let locale = workspace.availableLanguages.first(where: { $0.identifier == identifier }) {
+                    workspace.setLanguage(locale)
+                }
+            }
+        )
+    }
+}
+
+private struct PaneAction {
+    let title: String
+    let systemImage: String
+    let help: String
+    let isEnabled: Bool
+    let shortcut: KeyboardShortcut
+    let perform: () -> Void
+}
+
 private struct PreviewPane: View {
     @Environment(Workspace.self) private var workspace
 
     let title: String
+    var tabs: Binding<Workspace.TranscriptTab>? = nil
     let text: Binding<String>
     let placeholder: String
     let isBusy: Bool
     var progress: Double? = nil
     let isEditable: Bool
-    let primaryTitle: String
-    let primaryEnabled: Bool
-    let primaryAction: () -> Void
+    let primary: PaneAction
+    var secondary: PaneAction? = nil
     let showsStop: Bool
     let copyAction: () -> Void
     var locatesSource = false
@@ -289,23 +415,19 @@ private struct PreviewPane: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                Text(title)
-                    .font(LTTheme.labelFont)
-                    .tracking(0.8)
-                    .textCase(.uppercase)
-                    .foregroundStyle(LTTheme.muted)
-                if isBusy {
+                if let tabs {
+                    PaneTabs(selection: tabs)
+                } else {
+                    PaneLabel(title: title, isSelected: false)
+                }
+                if isBusy && tabs == nil {
                     ProgressView()
                         .controlSize(.mini)
                         .tint(LTTheme.muted)
                 }
                 Spacer(minLength: 8)
                 if !text.wrappedValue.isEmpty {
-                    Button(action: copyAction) {
-                        Label("Copy", systemImage: "doc.on.doc")
-                    }
-                    .buttonStyle(LTActionButtonStyle())
-                    .help("Copy \(title.lowercased()) to the clipboard")
+                    CopyButton(subject: title.lowercased(), action: copyAction)
                 }
                 if showsStop {
                     Button(action: workspace.stop) {
@@ -315,16 +437,16 @@ private struct PreviewPane: View {
                     .keyboardShortcut(".", modifiers: .command)
                     .help("Stop \(title.lowercased())")
                 } else {
-                    Button(action: primaryAction) {
-                        Label(primaryTitle, systemImage: primaryTitle == "Summarize" ? "text.alignleft" : "waveform")
+                    if let secondary {
+                        Button(action: secondary.perform) {
+                            Label(secondary.title, systemImage: secondary.systemImage)
+                        }
+                        .buttonStyle(LTIconButtonStyle())
+                        .disabled(!secondary.isEnabled)
+                        .help(secondary.help)
+                        .keyboardShortcut(secondary.shortcut)
                     }
-                    .buttonStyle(LTActionButtonStyle(emphasized: true))
-                    .disabled(!primaryEnabled)
-                    .help(primaryHelp)
-                    .keyboardShortcut(
-                        primaryTitle == "Summarize" ? KeyEquivalent("s") : KeyEquivalent("t"),
-                        modifiers: primaryTitle == "Summarize" ? [.command, .shift] : [.command]
-                    )
+                    actionButton(primary, emphasized: true)
                 }
             }
             .padding(.horizontal, LTTheme.spaceLG)
@@ -353,11 +475,14 @@ private struct PreviewPane: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    private var primaryHelp: String {
-        if primaryTitle == "Summarize" {
-            return "Write a summary of the transcript"
+    private func actionButton(_ action: PaneAction, emphasized: Bool) -> some View {
+        Button(action: action.perform) {
+            Label(action.title, systemImage: action.systemImage)
         }
-        return "Turn this recording into text"
+        .buttonStyle(LTActionButtonStyle(emphasized: emphasized))
+        .disabled(!action.isEnabled)
+        .help(action.help)
+        .keyboardShortcut(action.shortcut)
     }
 
     @ViewBuilder
@@ -439,6 +564,96 @@ private struct PreviewPane: View {
                 workspace.clearSourceHighlight()
             } : nil
         )
+    }
+}
+
+/// Icon-only copy control that briefly turns into a "Copied" confirmation.
+private struct CopyButton: View {
+    let subject: String
+    let action: () -> Void
+
+    @State private var showsConfirmation = false
+    @State private var resetTask: Task<Void, Never>?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if showsConfirmation {
+                Text("Copied")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(LTTheme.accent)
+                    .transition(.opacity.combined(with: .offset(x: 6)))
+            }
+            Button {
+                action()
+                confirm()
+            } label: {
+                Label(
+                    showsConfirmation ? "Copied" : "Copy",
+                    systemImage: showsConfirmation ? "checkmark" : "doc.on.doc"
+                )
+                .foregroundStyle(showsConfirmation ? LTTheme.accent : LTTheme.ink.opacity(0.78))
+                .contentTransition(.symbolEffect(.replace))
+            }
+            .buttonStyle(LTIconButtonStyle())
+            .help("Copy \(subject) to the clipboard")
+        }
+        .animation(.easeOut(duration: 0.18), value: showsConfirmation)
+        .onDisappear { resetTask?.cancel() }
+    }
+
+    private func confirm() {
+        showsConfirmation = true
+        AccessibilityNotification.Announcement("Copied \(subject)").post()
+        resetTask?.cancel()
+        resetTask = Task {
+            try? await Task.sleep(for: .seconds(1.6))
+            guard !Task.isCancelled else { return }
+            showsConfirmation = false
+        }
+    }
+}
+
+private struct PaneLabel: View {
+    let title: String
+    let isSelected: Bool
+
+    var body: some View {
+        Text(title)
+            .font(LTTheme.labelFont)
+            .tracking(0.8)
+            .textCase(.uppercase)
+            .foregroundStyle(isSelected ? LTTheme.ink : LTTheme.muted)
+    }
+}
+
+private struct PaneTabs: View {
+    @Binding var selection: Workspace.TranscriptTab
+
+    var body: some View {
+        HStack(spacing: 14) {
+            tab("Transcript", .transcript)
+            tab("Translation", .translation)
+        }
+    }
+
+    private func tab(_ title: String, _ value: Workspace.TranscriptTab) -> some View {
+        Button {
+            selection = value
+        } label: {
+            PaneLabel(title: title, isSelected: selection == value)
+                .padding(.vertical, 4)
+                .overlay(alignment: .bottom) {
+                    Capsule()
+                        .fill(LTTheme.accent)
+                        .frame(height: 1.5)
+                        .opacity(selection == value ? 1 : 0)
+                }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .pointerStyle(.link)
+        .help("Show the \(title.lowercased())")
+        .animation(.easeOut(duration: 0.15), value: selection)
     }
 }
 

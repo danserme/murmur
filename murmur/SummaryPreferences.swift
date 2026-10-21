@@ -89,8 +89,9 @@ nonisolated enum SummaryPreferences {
 
     static var systemPrompt: String {
         """
-        You summarize English voice memo transcripts for the person who recorded them.
+        You summarize voice memo transcripts for the person who recorded them.
         Stay faithful to the recording. Do not invent names, dates, or tasks.
+        Write the notes in the same language as the transcript.
         Write the notes in this structure:
 
         \(noteStructure)

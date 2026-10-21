@@ -1,6 +1,8 @@
 import AppKit
 import Foundation
+import NaturalLanguage
 import Observation
+import Translation
 import UniformTypeIdentifiers
 
 @Observable
@@ -17,10 +19,24 @@ final class Workspace {
     var jobProgress: Double?
     var sourceHighlight: NSRange?
     var sourceHighlightTick = 0
+    var transcriptionLocale = TranscriptionLanguage.selected
+    var availableLanguages: [Locale] = []
+    var transcriptLocale: Locale? {
+        didSet { updateSourceLanguage() }
+    }
+    /// Language of the text in the transcript pane: the transcription language, or detected for typed text.
+    private(set) var sourceLanguage: Locale.Language?
+    var translation = ""
+    var isTranslating = false
+    var translationProgress: Double?
+    var transcriptTab: TranscriptTab = .transcript
+    var translationConfiguration: TranslationSession.Configuration?
     let capture = AudioCapture()
 
     @ObservationIgnored
     private var runningTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var translationCancelled = false
 
     var displayedTranscript: String {
         liveTranscript.isEmpty ? transcript : liveTranscript
@@ -36,12 +52,39 @@ final class Workspace {
             && !capture.isRecording
     }
 
+    var languageTitle: String {
+        TranscriptionLanguage.title(for: transcriptionLocale)
+    }
+
+    var canChangeLanguage: Bool {
+        !phase.isBusy
+    }
+
+    /// The transcript is in a language other than English, so it can be translated.
+    var needsTranslation: Bool {
+        guard let sourceLanguage else { return false }
+        return sourceLanguage.languageCode != .english
+    }
+
+    var showsTranslationTab: Bool {
+        needsTranslation || !translation.isEmpty
+    }
+
+    var canTranslate: Bool {
+        needsTranslation
+            && !displayedTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !isTranslating
+            && phase != .preparing
+            && phase != .transcribing
+            && !capture.isRecording
+    }
+
     var canRecord: Bool {
         !phase.isBusy
     }
 
     var canStop: Bool {
-        phase.isBusy || capture.isRecording
+        phase.isBusy || capture.isRecording || isTranslating
     }
 
     var allowedContentTypes: [UTType] {
@@ -50,6 +93,20 @@ final class Workspace {
 
     func refreshSummaryAvailability() {
         summaryAvailability = SummaryService.availabilityMessage()
+    }
+
+    func loadLanguages() async {
+        guard availableLanguages.isEmpty else { return }
+        availableLanguages = await TranscriptionLanguage.supported()
+    }
+
+    func setLanguage(_ locale: Locale) {
+        guard canChangeLanguage, !TranscriptionLanguage.matches(locale, transcriptionLocale) else { return }
+        transcriptionLocale = locale
+        TranscriptionLanguage.selected = locale
+        if recording != nil && !capture.isRecording {
+            statusMessage = "Language set to \(languageTitle). Press Transcribe to redo this recording."
+        }
     }
 
     func importFile(from url: URL) {
@@ -129,19 +186,23 @@ final class Workspace {
         liveTranscript = ""
         jobProgress = nil
         clearSourceHighlight()
+        resetTranslation()
         phase = .preparing
-        statusMessage = "Preparing on-device English speech model…"
+        statusMessage = "Preparing on-device \(languageTitle) speech model…"
 
         let url = recording.fileURL
+        let locale = transcriptionLocale
+        transcriptLocale = locale
         runningTask?.cancel()
         runningTask = Task {
             do {
-                let text = try await TranscriptionService.transcribe(fileURL: url) { [weak self] update in
+                let text = try await TranscriptionService.transcribe(fileURL: url, locale: locale) { [weak self] update in
                     self?.apply(update)
                 }
                 guard !Task.isCancelled else { return }
                 transcript = text
                 liveTranscript = ""
+                updateSourceLanguage()
                 jobProgress = 1
                 phase = .transcribed
                 statusMessage = SummaryService.transcribedStatusMessage()
@@ -170,6 +231,10 @@ final class Workspace {
             stopRecording()
             return
         }
+        if isTranslating && !phase.isBusy {
+            translationCancelled = true
+            return
+        }
         guard canStop else { return }
         runningTask?.cancel()
         runningTask = nil
@@ -186,10 +251,16 @@ final class Workspace {
         liveTranscript = ""
         transcript = value
         clearSourceHighlight()
+        if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            transcriptLocale = nil
+        } else {
+            updateSourceLanguage()
+        }
     }
 
     @discardableResult
     func revealSource(for summarySelection: String) -> Bool {
+        transcriptTab = .transcript
         guard let range = TranscriptAnchor.utf16Range(in: displayedTranscript, matching: summarySelection) else {
             sourceHighlight = nil
             return false
@@ -197,6 +268,66 @@ final class Workspace {
         sourceHighlight = range
         sourceHighlightTick += 1
         return true
+    }
+
+    func requestTranslation() {
+        guard canTranslate, let sourceLanguage else { return }
+        transcriptTab = .translation
+        let configuration = TranslationSession.Configuration(
+            source: sourceLanguage,
+            target: Locale.Language(identifier: "en")
+        )
+        if translationConfiguration == configuration {
+            translationConfiguration?.invalidate()
+        } else {
+            translationConfiguration = configuration
+        }
+    }
+
+    /// Runs from `.translationTask`, which supplies the session and asks to download missing languages.
+    func translate(using session: TranslationSession) async {
+        let text = displayedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !isTranslating else { return }
+        isTranslating = true
+        translationCancelled = false
+        translation = ""
+        translationProgress = 0
+        errorMessage = nil
+        statusMessage = "Translating to English on this Mac…"
+
+        // TranslationSession isn't Sendable, but this task is its only user.
+        nonisolated(unsafe) let session = session
+        let chunks = Self.translationChunks(of: text)
+        var parts: [String] = []
+        do {
+            for (index, chunk) in chunks.enumerated() {
+                guard !translationCancelled, !Task.isCancelled else { break }
+                let response = try await session.translate(chunk)
+                parts.append(response.targetText)
+                translation = parts.joined(separator: " ")
+                translationProgress = Double(index + 1) / Double(chunks.count)
+            }
+            if !phase.isBusy {
+                statusMessage = parts.count < chunks.count
+                    ? "Stopped translation. Partial translation kept."
+                    : "Translated to English."
+            }
+        } catch {
+            if !translationCancelled {
+                errorMessage = "Could not translate this transcript. \(error.localizedDescription)"
+                statusMessage = parts.isEmpty ? "Translation did not finish." : "Translation stopped early. Partial translation kept."
+            }
+        }
+        isTranslating = false
+        translationProgress = nil
+    }
+
+    func replaceTranslation(_ value: String) {
+        translation = value
+    }
+
+    func copyTranslation() {
+        copyToPasteboard(translation)
     }
 
     func clearSourceHighlight() {
@@ -243,6 +374,49 @@ final class Workspace {
         }
     }
 
+    private func updateSourceLanguage() {
+        if let transcriptLocale {
+            sourceLanguage = Locale.Language(languageCode: transcriptLocale.language.languageCode)
+            return
+        }
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(String(displayedTranscript.prefix(4000)))
+        if let (language, confidence) = recognizer.languageHypotheses(withMaximum: 1).first, confidence > 0.6 {
+            sourceLanguage = Locale.Language(identifier: language.rawValue)
+        } else {
+            sourceLanguage = nil
+        }
+    }
+
+    private func resetTranslation() {
+        translationCancelled = true
+        translation = ""
+        transcriptTab = .transcript
+        transcriptLocale = nil
+    }
+
+    /// Groups sentences into requests of a few hundred characters, so each keeps some context.
+    private static func translationChunks(of text: String, target: Int = 600) -> [String] {
+        let tokenizer = NLTokenizer(unit: .sentence)
+        tokenizer.string = text
+        var chunks: [String] = []
+        var current = ""
+        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+            let sentence = text[range].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !sentence.isEmpty else { return true }
+            if !current.isEmpty && current.count + sentence.count > target {
+                chunks.append(current)
+                current = ""
+            }
+            current += current.isEmpty ? sentence : " " + sentence
+            return true
+        }
+        if !current.isEmpty {
+            chunks.append(current)
+        }
+        return chunks
+    }
+
     private func keepPartialTranscript(status: String) {
         let partial = displayedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         transcript = partial
@@ -257,7 +431,7 @@ final class Workspace {
         case .downloadingModel(let fraction):
             phase = .preparing
             jobProgress = fraction
-            statusMessage = "Downloading the English speech model. This happens once."
+            statusMessage = "Downloading the \(languageTitle) speech model. This happens once."
         case .transcribing(let text, let fraction):
             phase = .transcribing
             if let text {
@@ -279,6 +453,11 @@ final class Workspace {
 }
 
 extension Workspace {
+    enum TranscriptTab: Hashable {
+        case transcript
+        case translation
+    }
+
     enum Phase: Equatable {
         case idle
         case ready
